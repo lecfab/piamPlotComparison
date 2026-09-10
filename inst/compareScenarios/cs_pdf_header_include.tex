@@ -1,16 +1,19 @@
 \usepackage{titlesec}
+% \titleformat{cmd}{format}{label}{sep}{before-code}[after-code]
+%   format: font/style applied to label+title, label: section number,
+%   sep: horizontal space between label and title
+%   before-code: code run right before the title
+%   after-code (optional): code run right after the title
 \titleformat{\section}
     {\normalfont\Large\bfseries}
     {\thesection}
     {1em}
-    {}
-    [\newpage]
+    {\newpage}
 \titleformat{\subsection}
     {\normalfont\Large\bfseries}
     {\thesubsection}
     {1em}
-    {}
-    [\newpage]
+    {\newpage}
 \titleformat{\paragraph}
    {\normalfont\bfseries}
    {\theparagraph\ }
