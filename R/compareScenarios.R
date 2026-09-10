@@ -28,6 +28,23 @@
 #'   Set this to \code{globalenv()} and \code{sections} to \code{NULL} to load
 #'   an preprocess data in your global environment during development.
 #' @param quiet \code{logical(1)}. Suppress printing during rendering?
+#' @param mc.cores \code{integer(1)} or \code{NULL}. Default: \code{NULL}.
+#'   Number of sections to render in parallel (forked worker processes, via
+#'   \code{\link[parallel:mclapply]{parallel::mclapply()}}). Only used for
+#'   \code{outputFormat = "pdf"}; other formats always render sequentially.
+#'   Each section is rendered as an independent, self-contained document that
+#'   re-reads and re-preprocesses \code{mifScen}/\code{mifHist}, so the
+#'   speed-up is smaller than \code{mc.cores} would suggest for cheap mifs,
+#'   but substantial once section-specific plotting dominates runtime (as is
+#'   typical for large multi-scenario comparisons). The resulting per-section
+#'   PDFs are combined into a single PDF using the \code{qpdf} or
+#'   \code{pdfunite} command line tool (one of them must be on the \code{PATH}).
+#'   Note the combined PDF has one table of contents and page numbering per
+#'   section rather than a single continuous one.
+#'   Set to \code{1} to disable parallel rendering and reproduce the exact
+#'   original, sequential single-process behavior. Defaults to the number of
+#'   CPUs allocated to the job (\code{SLURM_CPUS_PER_TASK}) or, absent that,
+#'   \code{parallel::detectCores()}; always \code{1} on Windows.
 #' @param ... YAML parameters, see below.
 #' @importFrom piamutils getSystemFile
 #' @return The value returned by \code{\link[rmarkdown:render]{rmarkdown::render()}}.
@@ -130,6 +147,7 @@ compareScenarios <- function(
     outputFormat = "PDF",
     envir = new.env(),
     quiet = FALSE,
+    mc.cores = NULL,
     ...
 ) {
   # Set yaml parameters and convert relative to absolute paths.
@@ -171,18 +189,144 @@ compareScenarios <- function(
   # avoid potential problems with write permissions on the copied files
   Sys.chmod(list.files(outputDir, full.names = TRUE))
 
-  rmarkdown::render(
-    templateInOutputDir,
-    intermediates_dir = outputDir,
-    output_dir = outputDir,
-    output_file = outputFile,
-    output_format = outputFormat,
-    params = yamlParams,
-    envir = envir,
-    quiet = quiet
-  )
+  if (is.null(mc.cores)) mc.cores <- .defaultMcCores()
+  mc.cores <- max(1L, as.integer(mc.cores))
+
+  if (mc.cores > 1 && outputFormat != "pdf_document") {
+    if (!quiet) {
+      message("Parallel rendering (mc.cores > 1) is only supported for PDF output. Rendering sequentially.")
+    }
+    mc.cores <- 1L
+  }
+
+  if (mc.cores > 1) {
+    .renderScenariosParallel(
+      templateInOutputDir = templateInOutputDir,
+      outputDir = outputDir,
+      outputFile = outputFile,
+      outputFormat = outputFormat,
+      yamlParams = yamlParams,
+      quiet = quiet,
+      mc.cores = mc.cores)
+  } else {
+    rmarkdown::render(
+      templateInOutputDir,
+      intermediates_dir = outputDir,
+      output_dir = outputDir,
+      output_file = outputFile,
+      output_format = outputFormat,
+      params = yamlParams,
+      envir = envir,
+      quiet = quiet
+    )
+  }
 
   unlink(file.path(outputDir, "compareScenarios"), recursive = TRUE)
+}
+
+# Default number of cores to use for parallel section rendering.
+.defaultMcCores <- function() {
+  if (!identical(.Platform$OS.type, "unix")) return(1L)
+  slurmCores <- suppressWarnings(as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "")))
+  if (!is.na(slurmCores) && slurmCores > 0) return(slurmCores)
+  cores <- suppressWarnings(parallel::detectCores())
+  if (is.na(cores) || cores < 1) 1L else cores
+}
+
+# Resolves the ordered vector of section *.Rmd file names (as in cs_main.Rmd's
+# 'sectionPaths' chunk) for a given 'sections' YAML parameter.
+.resolveSectionFiles <- function(csDir, sections) {
+  files <- sort(list.files(csDir, pattern = "^cs_[0-9]+.*\\.Rmd$"))
+  nums <- as.numeric(sub("^cs_([0-9]+).*$", "\\1", files))
+
+  if (is.null(sections)) sections <- "all"
+
+  if (length(sections) == 1 && identical(sections, "all")) {
+    return(files)
+  }
+  if (is.numeric(sections)) {
+    return(files[match(sections, nums)][!is.na(match(sections, nums))])
+  }
+  if (length(sections) > 0) {
+    return(paste0("cs_", sections, ".Rmd"))
+  }
+  character(0)
+}
+
+# Renders each section (plus the user section, if any) as an independent,
+# self-contained PDF in parallel forked worker processes, then combines the
+# resulting PDFs into a single PDF.
+.renderScenariosParallel <- function(templateInOutputDir, outputDir, outputFile,
+                                     outputFormat, yamlParams, quiet, mc.cores) {
+  csDir <- dirname(templateInOutputDir)
+  sectionFiles <- .resolveSectionFiles(csDir, yamlParams[["sections"]])
+
+  # jobs: one entry per section file, plus one more for the user section, if any.
+  jobs <- as.list(sectionFiles)
+  if (!is.null(yamlParams[["userSectionPath"]])) {
+    jobs <- c(jobs, list(NA_character_))
+  }
+  if (length(jobs) == 0) {
+    stop("No sections to render (the 'sections' parameter resolved to an empty selection).")
+  }
+
+  renderJob <- function(i) {
+    jobParams <- yamlParams
+    if (is.na(jobs[[i]])) {
+      jobParams$sections <- character(0)
+    } else {
+      jobParams$sections <- as.numeric(sub("^cs_([0-9]+).*$", "\\1", jobs[[i]]))
+      jobParams$userSectionPath <- NULL
+    }
+    partFile <- sprintf("%s_part%03d", outputFile, i)
+    intermediatesDir <- tempfile("cs2_intermediates_")
+    dir.create(intermediatesDir)
+    on.exit(unlink(intermediatesDir, recursive = TRUE), add = TRUE)
+    rmarkdown::render(
+      templateInOutputDir,
+      intermediates_dir = intermediatesDir,
+      output_dir = outputDir,
+      output_file = partFile,
+      output_format = outputFormat,
+      params = jobParams,
+      envir = new.env(),
+      quiet = quiet)
+  }
+
+  results <- parallel::mclapply(
+    seq_along(jobs), renderJob,
+    mc.cores = min(mc.cores, length(jobs)), mc.preschedule = FALSE)
+
+  failed <- vapply(results, function(x) inherits(x, "try-error"), logical(1))
+  if (any(failed)) {
+    msgs <- vapply(results[failed], function(x) attr(x, "condition")$message %||% as.character(x), character(1))
+    stop("Parallel rendering failed for ", sum(failed), " section(s):\n", paste(msgs, collapse = "\n"))
+  }
+
+  partFiles <- vapply(results, identity, character(1))
+  finalOutput <- file.path(outputDir, paste0(outputFile, ".pdf"))
+  .mergePdfs(partFiles, finalOutput)
+  unlink(partFiles)
+  invisible(finalOutput)
+}
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# Combines several PDFs into one, using qpdf if available, else pdfunite.
+.mergePdfs <- function(files, output) {
+  if (nzchar(Sys.which("qpdf"))) {
+    status <- system2("qpdf", c("--empty", "--pages", files, "--", output))
+  } else if (nzchar(Sys.which("pdfunite"))) {
+    status <- system2("pdfunite", c(files, output))
+  } else {
+    stop(
+      "Parallel rendering (mc.cores > 1) requires the 'qpdf' or 'pdfunite' ",
+      "command line tool to combine the section PDFs, but neither was found on the PATH.")
+  }
+  if (!identical(status, 0L)) {
+    stop("Combining section PDFs into '", output, "' failed (exit status ", status, ").")
+  }
+  invisible(output)
 }
 
 # Copies the CompareScenarios-Rmds to the specified location and modifies

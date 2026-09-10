@@ -17,6 +17,7 @@ Imports:
     knitr,
     magclass,
     mip (>= 0.148.11),
+    parallel,
     piamutils,
     quitte,
     rlang,
